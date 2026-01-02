@@ -6,149 +6,150 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { CONFIG } from "./config.js";
 
-// ===== Path Fix =====
+/* ---------- PATH SETUP ---------- */
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// ===== Load Firebase JSON SAFELY =====
+/* ---------- LOAD FIREBASE JSON ---------- */
 const serviceAccount = JSON.parse(
   fs.readFileSync(path.join(__dirname, "firebase.json"), "utf8")
 );
 
+/* ---------- INIT ---------- */
 const app = express();
 app.use(express.json());
 
-// ===== FIREBASE INIT =====
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
 const db = admin.firestore();
 
-// ===== TELEGRAM WEBHOOK =====
+/* ---------- TELEGRAM WEBHOOK ---------- */
 app.post("/", async (req, res) => {
-  res.send("OK"); // Fast response to Telegram to prevent timeout
+  res.send("OK"); // Telegram ko fast response
 
   try {
-    const message = req.body.message;
-    if (!message) return;
+    const msg = req.body.message;
+    if (!msg) return;
 
-    const chatId = message.chat.id.toString();
-    // Authorized User Check
-    if (chatId !== CONFIG.AUTHORIZED_USER_ID) {
-      console.log(`Unauthorized access: ${chatId}`);
-      return; 
-    }
+    const chatId = msg.chat.id.toString();
+    if (chatId !== CONFIG.AUTHORIZED_USER_ID) return;
 
-    const text = message.text;
+    const text = msg.text;
     if (!text) return;
 
-    // AI se expense extract karein
-    const expense = await extractExpenseUsingAI(text);
-    
+    // 🔥 SMART PARSER (AI + FALLBACK)
+    const expense = await parseExpense(text);
+
     if (!expense) {
-      await sendMessage(chatId, "❌ Samajh nahi aaya. Try: '50rs ke momos khaye'");
+      await sendMessage(chatId, "❌ Amount nahi mila");
       return;
     }
 
-    // Firestore me save karein
     await db.collection("expenses").add({
       ...expense,
-      createdAt: new Date(), // Simple date object
+      createdAt: new Date(),
     });
 
-    // Success Message
     await sendMessage(
       chatId,
-      `✅ *Saved*\n💰 ₹${expense.amount} | ${expense.category}\n📝 ${expense.remarks}`
+      `✅ Saved\n₹${expense.amount} | ${expense.category}`
     );
-
   } catch (err) {
-    console.log("❌ Error:", err.message);
-    await sendMessage(CONFIG.AUTHORIZED_USER_ID, `⚠️ Error: ${err.message}`);
+    console.log("Error:", err.message);
   }
 });
 
-// ===== GEMINI AI (UPDATED FOR 2.5 FLASH) =====
-async function extractExpenseUsingAI(text) {
-  // ✅ Apka diya hua naya Model URL (Gemini 2.5 Flash)
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${CONFIG.GEMINI_API_KEY}`;
-
-  const todayDate = new Date().toISOString().split('T')[0];
-
-  // AI Ko Role Dena (System Instruction)
-  const systemInstruction = {
-    parts: [{
-      text: `You are an Expense Tracker Bot.
-      Current Date: ${todayDate}
-      
-      Task: Extract expense details from the user's input.
-      
-      Rules:
-      1. Output MUST be valid JSON only. No markdown, no "Here is the json".
-      2. If the user input is NOT an expense (e.g. "Hi", "Hello"), return null.
-      3. Default currency is INR (₹).
-      
-      JSON Structure:
-      {
-        "type": "Debit",
-        "amount": number,
-        "category": "Food" | "Travel" | "Shopping" | "Bills" | "Other",
-        "mode": "Cash" | "Online" | "UPI",
-        "remarks": string,
-        "date": "YYYY-MM-DD"
-      }`
-    }]
-  };
-
+/* ---------- MAIN PARSER ---------- */
+async function parseExpense(text) {
+  // 1️⃣ Try AI
   try {
-    const response = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        system_instruction: systemInstruction, // Role definition
-        contents: [{ parts: [{ text: text }] }], // User message
-        generationConfig: {
-          response_mime_type: "application/json" // ✅ Force JSON response
-        }
-      }),
-    });
+    const ai = await extractUsingAI(text);
+    if (ai && ai.amount) return ai;
+  } catch (e) {}
 
-    const json = await response.json();
+  // 2️⃣ Fallback REGEX (AI fail ho to bhi kaam kare)
+  const match = text.match(/(\d+)/);
+  if (!match) return null;
 
-    // Debugging ke liye (Agar error aaye to console me dikhega)
-    if (json.error) {
-      console.error("⚠️ AI API Error:", JSON.stringify(json.error, null, 2));
-      return null;
-    }
-
-    if (!json.candidates || !json.candidates[0].content) return null;
-
-    const rawText = json.candidates[0].content.parts[0].text;
-    return JSON.parse(rawText);
-
-  } catch (error) {
-    console.error("❌ AI Processing Error:", error);
-    return null;
-  }
+  return {
+    type: "Debit",
+    amount: Number(match[1]),
+    category: guessCategory(text),
+    mode: guessMode(text),
+    remarks: text,
+    date: "Today",
+  };
 }
 
-// ===== TELEGRAM SEND =====
+/* ---------- GEMINI AI ---------- */
+async function extractUsingAI(text) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${CONFIG.GEMINI_API_KEY}`;
+
+  const prompt = `
+You are an expense extractor.
+User text: "${text}"
+
+Return ONLY JSON.
+Always guess if unsure.
+
+Fields:
+type: "Debit"
+amount: number
+category: short word
+mode: cash/upi/card/unknown
+remarks: original text
+date: Today or YYYY-MM-DD
+`;
+
+  const r = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      contents: [{ parts: [{ text: prompt }] }],
+    }),
+  });
+
+  const j = await r.json();
+  if (!j.candidates) return null;
+
+  const clean = j.candidates[0].content.parts[0].text
+    .replace(/```json|```/g, "")
+    .trim();
+
+  return JSON.parse(clean);
+}
+
+/* ---------- HELPERS ---------- */
+function guessCategory(text) {
+  const t = text.toLowerCase();
+  if (t.includes("chai")) return "chai";
+  if (t.includes("petrol")) return "petrol";
+  if (t.includes("food")) return "food";
+  return "misc";
+}
+
+function guessMode(text) {
+  const t = text.toLowerCase();
+  if (t.includes("upi")) return "upi";
+  if (t.includes("cash")) return "cash";
+  if (t.includes("card")) return "card";
+  return "unknown";
+}
+
+/* ---------- TELEGRAM SEND ---------- */
 async function sendMessage(chatId, text) {
   await fetch(
     `https://api.telegram.org/bot${CONFIG.TELEGRAM_BOT_TOKEN}/sendMessage`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ 
-        chat_id: chatId, 
-        text: text,
-        parse_mode: "Markdown" 
-      }),
+      body: JSON.stringify({ chat_id: chatId, text }),
     }
   );
 }
 
-// ===== SERVER =====
+/* ---------- SERVER ---------- */
 app.listen(3000, () => {
-  console.log("🚀 Expense bot is running...");
+  console.log("🚀 Expense bot running on port 3000");
 });
