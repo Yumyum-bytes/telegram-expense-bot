@@ -1,22 +1,32 @@
 import express from "express";
 import fetch from "node-fetch";
 import admin from "firebase-admin";
-import serviceAccount from "./firebase.json" assert { type: "json" };
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
 import { CONFIG } from "./config.js";
+
+// ===== Path Fix =====
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// ===== Load Firebase JSON SAFELY =====
+const serviceAccount = JSON.parse(
+  fs.readFileSync(path.join(__dirname, "firebase.json"), "utf8")
+);
 
 const app = express();
 app.use(express.json());
 
-// ================= FIREBASE INIT =================
+// ===== FIREBASE INIT =====
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
 const db = admin.firestore();
 
-// ================= TELEGRAM WEBHOOK =================
+// ===== TELEGRAM WEBHOOK =====
 app.post("/", async (req, res) => {
-  // Telegram ko fast OK
-  res.send("OK");
+  res.send("OK"); // fast response
 
   try {
     const message = req.body.message;
@@ -25,10 +35,7 @@ app.post("/", async (req, res) => {
     const chatId = message.chat.id.toString();
     if (chatId !== CONFIG.AUTHORIZED_USER_ID) return;
 
-    const text =
-      message.text ||
-      (message.voice ? "Voice message received" : "");
-
+    const text = message.text;
     if (!text) return;
 
     const expense = await extractExpenseUsingAI(text);
@@ -51,7 +58,7 @@ app.post("/", async (req, res) => {
   }
 });
 
-// ================= GEMINI AI =================
+// ===== GEMINI AI =====
 async function extractExpenseUsingAI(text) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${CONFIG.GEMINI_API_KEY}`;
 
@@ -67,8 +74,6 @@ category
 mode
 remarks
 date (YYYY-MM-DD or Today)
-
-Return ONLY JSON.
 `;
 
   const response = await fetch(url, {
@@ -89,7 +94,7 @@ Return ONLY JSON.
   return JSON.parse(cleanText);
 }
 
-// ================= TELEGRAM SEND =================
+// ===== TELEGRAM SEND =====
 async function sendMessage(chatId, text) {
   await fetch(
     `https://api.telegram.org/bot${CONFIG.TELEGRAM_BOT_TOKEN}/sendMessage`,
@@ -101,7 +106,7 @@ async function sendMessage(chatId, text) {
   );
 }
 
-// ================= SERVER =================
+// ===== SERVER =====
 app.listen(3000, () => {
   console.log("🚀 Expense bot running on port 3000");
 });
