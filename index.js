@@ -1,155 +1,87 @@
 import express from "express";
-import fetch from "node-fetch";
+import axios from "axios";
+import dotenv from "dotenv";
 import admin from "firebase-admin";
-import fs from "fs";
-import path from "path";
-import { fileURLToPath } from "url";
-import { CONFIG } from "./config.js";
 
-/* ---------- PATH SETUP ---------- */
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+dotenv.config();
 
-/* ---------- LOAD FIREBASE JSON ---------- */
-const serviceAccount = JSON.parse(
-  fs.readFileSync(path.join(__dirname, "firebase.json"), "utf8")
-);
-
-/* ---------- INIT ---------- */
 const app = express();
 app.use(express.json());
 
+/* ---------------- FIREBASE ---------------- */
 admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
+  credential: admin.credential.cert({
+    projectId: process.env.FIREBASE_PROJECT_ID,
+    clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+    privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n"),
+  }),
 });
+
 const db = admin.firestore();
 
-/* ---------- TELEGRAM WEBHOOK ---------- */
-app.post("/", async (req, res) => {
-  res.send("OK"); // Telegram ko fast response
+/* ---------------- TELEGRAM ---------------- */
+const TELEGRAM_API = `https://api.telegram.org/bot${process.env.BOT_TOKEN}`;
+
+/* ---------------- GROQ ---------------- */
+async function parseExpense(text) {
+  const prompt = `
+Extract expense info from this text.
+Return JSON ONLY.
+
+Fields:
+amount (number)
+type (expense/income)
+mode (cash | office_phonepe | naveen_phonepe)
+category
+description
+
+Text: "${text}"
+`;
+
+  const res = await axios.post(
+    "https://api.groq.com/openai/v1/chat/completions",
+    {
+      model: "llama3-8b-8192",
+      messages: [{ role: "user", content: prompt }],
+      temperature: 0.1,
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+    }
+  );
+
+  return JSON.parse(res.data.choices[0].message.content);
+}
+
+/* ---------------- WEBHOOK ---------------- */
+app.post("/webhook", async (req, res) => {
+  res.send("OK");
+
+  const msg = req.body.message;
+  if (!msg || !msg.text) return;
 
   try {
-    const msg = req.body.message;
-    if (!msg) return;
+    const expense = await parseExpense(msg.text);
 
-    const chatId = msg.chat.id.toString();
-    if (chatId !== CONFIG.AUTHORIZED_USER_ID) return;
-
-    const text = msg.text;
-    if (!text) return;
-
-    // 🔥 SMART PARSER (AI + FALLBACK)
-    const expense = await parseExpense(text);
-
-    if (!expense) {
-      await sendMessage(chatId, "❌ Amount nahi mila");
-      return;
-    }
-
-    await db.collection("expenses").add({
+    await db.collection("ledger").add({
       ...expense,
-      createdAt: new Date(),
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      date: new Date().toISOString().slice(0, 10),
     });
 
-    await sendMessage(
-      chatId,
-      `✅ Saved\n₹${expense.amount} | ${expense.category}`
-    );
+    await axios.post(`${TELEGRAM_API}/sendMessage`, {
+      chat_id: msg.chat.id,
+      text: `✅ Saved\n₹${expense.amount} | ${expense.mode}`,
+    });
   } catch (err) {
-    console.log("Error:", err.message);
+    await axios.post(`${TELEGRAM_API}/sendMessage`, {
+      chat_id: msg.chat.id,
+      text: "❌ Samajh nahi aaya, thoda clear likho",
+    });
   }
 });
 
-/* ---------- MAIN PARSER ---------- */
-async function parseExpense(text) {
-  // 1️⃣ Try AI
-  try {
-    const ai = await extractUsingAI(text);
-    if (ai && ai.amount) return ai;
-  } catch (e) {}
-
-  // 2️⃣ Fallback REGEX (AI fail ho to bhi kaam kare)
-  const match = text.match(/(\d+)/);
-  if (!match) return null;
-
-  return {
-    type: "Debit",
-    amount: Number(match[1]),
-    category: guessCategory(text),
-    mode: guessMode(text),
-    remarks: text,
-    date: "Today",
-  };
-}
-
-/* ---------- GEMINI AI ---------- */
-async function extractUsingAI(text) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${CONFIG.GEMINI_API_KEY}`;
-
-  const prompt = `
-You are an expense extractor.
-User text: "${text}"
-
-Return ONLY JSON.
-Always guess if unsure.
-
-Fields:
-type: "Debit"
-amount: number
-category: short word
-mode: cash/upi/card/unknown
-remarks: original text
-date: Today or YYYY-MM-DD
-`;
-
-  const r = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      contents: [{ parts: [{ text: prompt }] }],
-    }),
-  });
-
-  const j = await r.json();
-  if (!j.candidates) return null;
-
-  const clean = j.candidates[0].content.parts[0].text
-    .replace(/```json|```/g, "")
-    .trim();
-
-  return JSON.parse(clean);
-}
-
-/* ---------- HELPERS ---------- */
-function guessCategory(text) {
-  const t = text.toLowerCase();
-  if (t.includes("chai")) return "chai";
-  if (t.includes("petrol")) return "petrol";
-  if (t.includes("food")) return "food";
-  return "misc";
-}
-
-function guessMode(text) {
-  const t = text.toLowerCase();
-  if (t.includes("upi")) return "upi";
-  if (t.includes("cash")) return "cash";
-  if (t.includes("card")) return "card";
-  return "unknown";
-}
-
-/* ---------- TELEGRAM SEND ---------- */
-async function sendMessage(chatId, text) {
-  await fetch(
-    `https://api.telegram.org/bot${CONFIG.TELEGRAM_BOT_TOKEN}/sendMessage`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, text }),
-    }
-  );
-}
-
-/* ---------- SERVER ---------- */
-app.listen(3000, () => {
-  console.log("🚀 Expense bot running on port 3000");
-});
+app.listen(3000, () => console.log("Bot running"));
